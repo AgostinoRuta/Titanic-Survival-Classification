@@ -1,0 +1,671 @@
+```{r}
+library(tidyverse) 
+library(dplyr) 
+library(skimr)
+library(summarytools)
+library(dlookr)
+library(factoextra)
+library(reshape2)
+library(glmnet)
+library(caret)
+library(gmodels)
+library(caretEnsemble)
+library(RWeka)
+```
+
+
+```{r}
+# DATA MANAGEMENT
+setwd("C:/Users/PC-NB/Desktop/ML short/kaggle/titanic")
+data1 = read.csv("train.csv")
+data2 = read.csv("test.csv")
+data = rbind(data1[,3:12], data2[,2:11])
+
+# Variable Fam size
+data = mutate(data, fam_size = SibSp + Parch+1)
+
+# Variable name.
+get_title <- function(name) {
+  title <- str_extract(name, "\\s([A-Za-z]+)\\.")
+  if (!is.na(title)) {
+    return(title)
+  } else {
+    return("")
+  }
+}
+
+extract_first_name <- function(full_name) {
+  # Use regular expression to extract the first word (assumed first name)
+  first_name <- str_extract(full_name, "\\b\\w+\\b")
+  return(first_name)
+}
+
+surname = as.data.frame(sapply(data$Name, extract_first_name))
+colnames(surname) = "surname"
+data = mutate(data, surname = surname$surname)
+```
+
+
+```{r}
+title = as.data.frame(sapply(data$Name, get_title))
+colnames(title) = "title_short"
+data = mutate(data, Title = title$title_short)
+
+data = mutate(data, Title_bin = ifelse(data$Title == " Miss.", 1, 
+                                   ifelse(data$Title == " Mrs.", 2, 
+                                          ifelse(data$Title == " Mr.", 3, 
+                                                 ifelse(data$Title == " Master.", 4, 0)))))
+
+data = select(data, -(Title), -(Name))
+```
+
+
+```{r}
+# Variable Sex
+data = mutate(data, Sex_dummy = ifelse(data$Sex == "male", 1, 0))
+data = select(data, -(Sex))
+```
+
+
+```{r}
+# Variable AGE
+d1 <- data
+d1_lm <- drop_na(d1)
+lm_model <- lm(Age ~ Fare + Pclass + Sex_dummy + SibSp, data = d1_lm)
+summary(lm_model)
+
+missing_age_rows <- d1[is.na(d1$Age), ]
+predictor_data <- missing_age_rows[c("Fare", "Pclass", "Sex_dummy", "SibSp")]
+predicted_ages <- predict(lm_model, newdata = predictor_data)
+predicted_ages[predicted_ages < 0] = min(d1_lm$Age)
+d1[is.na(d1$Age), ]$Age = predicted_ages
+```
+
+
+```{r}
+# Variable FARE
+d1_lm <- drop_na(d1)
+lm_model <- lm(Fare ~ 0 + Age + Pclass + Sex_dummy + SibSp, data = d1_lm) 
+#summary(lm_model)
+
+lm_model <- lm(Fare ~ 0 + Age + Pclass + SibSp, data = d1_lm)
+#summary(lm_model)
+
+missing_age_rows <- d1[is.na(d1$Fare), ]
+predictor_data <- missing_age_rows[c("Age", "Pclass", "SibSp")]
+predicted_ages <- predict(lm_model, newdata = predictor_data)
+predicted_ages[predicted_ages < 0] = min(d1_lm$Fare)
+
+
+d1[is.na(d1$Fare), ]$Fare = predicted_ages
+
+
+# Variable Cabin
+d1 = mutate(d1, Initial_Letter = ifelse(!is.na(Cabin), substr(Cabin, 1, 1), NA))
+
+d1 = mutate(d1, Deck = ifelse(Initial_Letter == "A", 1,
+                              ifelse(Initial_Letter == "B", 2,
+                                     ifelse(Initial_Letter == "C", 3,
+                                            ifelse(Initial_Letter == "D", 4,
+                                                   ifelse(Initial_Letter == "E", 5, 0))))))
+
+d1 = select(d1, -(Initial_Letter), -(Cabin) )
+d1
+```
+```{r}
+# In this chunk i will define the function all_duplicated. This takes in a DF
+# column and returns a vector of true or false depending on whether the object
+# in it appears more than once. It is very similar to the function "duplicated"
+# with the difference that it returns TRUE also at the first value.
+
+all_duplicated <- function(col) {
+  return(duplicated(col) | duplicated(col, fromLast = TRUE))
+}
+```
+
+
+```{r}
+#Variable GROUP
+Ticket_Duplicated <- as.integer(all_duplicated(data$Ticket))
+d3 = cbind(Ticket_Duplicated, d1)
+colnames(d3)[1] = "group"
+```
+
+
+```{r}
+# Group age average
+summary_data1 = dplyr::summarise(group_by(d3, surname), group_age_average = mean(Age))
+d3 = left_join(d3, summary_data1, by = "surname")
+
+# Age - Group age average
+d3 = mutate(d3, age_difference = Age - group_age_average)
+
+# Group count
+summary_data2 = dplyr::summarise(group_by(d3, Ticket), num_people_group = n())
+d3 = left_join(d3, summary_data2, by = "Ticket")
+
+# Fam age average
+summary_data3 = dplyr::summarise(group_by(d3, surname), fam_age_average = mean(Age))
+d3 = left_join(d3, summary_data3, by = "surname")
+
+```
+
+```{r}
+# Groups with children or old people
+d3 = mutate(d3, is_child_or_old = ifelse(d3$Age < 5 | d3$Age > 65, 1, 0))
+
+summary_data4 = dplyr::summarise(group_by(d3, surname), fam_with_child_or_old = sum(is_child_or_old))
+d3 = left_join(d3, summary_data4, by = c("surname"))
+
+summary_data5 = dplyr::summarise(group_by(d3, Ticket), grp_with_child_or_old = sum(is_child_or_old))
+d3 = left_join(d3, summary_data5, by = c("Ticket"))
+
+d3 = dplyr::select(d3, -(surname), -(Ticket))
+```
+
+
+```{r}
+# Variable EMBARKED
+d3 = mutate(d3, Embarked = ifelse(d1$Embarked == "S", 1, 
+                                      ifelse(d1$Embarked == "C", 2, 
+                                             ifelse(d3$Embarked == "Q", 3, 0))))
+
+
+# Variable FARE
+quantiles = quantile(d3$Fare, probs = c(.25, .5, .75))
+d3 <- mutate(d3, Fare_bin = ifelse(d3$Fare < quantiles[1], 1,
+                               ifelse(d3$Fare < quantiles[2], 2,
+                                      ifelse(d3$Fare < quantiles[3], 3, 4))))
+d3 = dplyr::select(d3, -(Fare))
+
+d3["fam_or_grp"] = ifelse(d3$fam_size == 1 & d3$num_people_group == 1, 0, 1)
+
+# One last assembly
+final_train = cbind(ifelse(data1[,2] == 1, "yes", "no"), d3[1:891,]) 
+colnames(final_train)[1] = "survived"
+```
+\section{capture joint effects}
+
+```{r}
+# SEX and PCLASS
+final_train[,1] <- ifelse(final_train[,1] == "no", 0, 1)
+
+final_train = dplyr::select(final_train, -(group))
+```
+
+```{r}
+# It is to be chosen with joint feature to consider. Not too many of them shall 
+# be considered to avoid overfitting. The possible fetures of interest are:
+# Sex_dummy, Pclass, Single or in group, if child/old or not.
+
+# BY Sex_dummy & Pclass.
+Summary1 <- final_train %>% group_by(Sex_dummy, Pclass) %>% dplyr::summarise(Sex_dummy_and_Pclass = mean(survived))
+d3 = left_join(d3, Summary1, by = c("Sex_dummy", "Pclass"))
+
+# BY Sex_dummy & Single or in group.
+Summary2 = final_train %>% group_by(Sex_dummy, fam_or_grp) %>% dplyr::summarise(Sex_dummy_and_company = mean(survived))
+d3 = left_join(d3, Summary2, by = c("Sex_dummy", "fam_or_grp"))
+
+# BY Single or in group & if child/old or not.
+Summary3 = final_train %>% group_by(fam_or_grp, is_child_or_old) %>% dplyr::summarise(company_and_age = mean(survived))
+d3 = left_join(d3, Summary3, by = c("is_child_or_old", "fam_or_grp"))
+```
+
+```{r}
+dataset1 = cbind(ifelse(data1[,2] == 1, "yes", "no"), d3[1:891,])
+dataset1 = cbind(data1[,2], d3[1:891,])
+
+
+# Remove costant columns
+dataset1 = dataset1[, !sapply(dataset1, function(x) length(unique(x)) == 1)]
+```
+
+```{r}
+# ADDITIONAL ONES
+# Variable women-children (WC)
+d3 = mutate(d3, WC = ifelse((d3$Sex_dummy == 1) & (d3$Age < 12) | (d3$Sex_dummy == 0), 1, 0))
+dataset1 = d3[1:891,]
+dataset1
+```
+```{r}
+d4 = cbind(surname = data$surname, ticket = data$Ticket, d3)
+d51 = cbind(ID= 1:891, data1["Survived"], d4[1:891,])
+d52 = d4[892:1309,]
+```
+
+```{r}
+d6 = d51[!all_duplicated(d51$surname), ]
+predictors = c("Pclass", "Age", "Embarked", "Title_bin", "Sex_dummy", "Deck", "Fare_bin", "WC")
+
+fitControl <- trainControl(
+  method="cv", 
+  number=3, 
+#  repeats=5,
+  savePredictions = 'final',  # Save predictions for the final model
+  classProbs = TRUE            # Save class probabilities
+)
+
+method_list <- c("nb", "knn", "xgbTree", "svmRadial", "svmPoly", "svmLinear", 
+                 "multinom", "bagFDA", "sda", "ada", "J48", "treebag", "ctree",
+                 "rf", "rpart", "pda2", "pls", "blackboost", "gbm", "glm", "JRip")
+
+set.seed(123)
+model_list2 <- suppressWarnings(caretList(
+  x = d6[,predictors], 
+  y = as.factor(ifelse(d6[,2] == 0, "no", "yes")), 
+  trControl = fitControl, 
+  methodList = method_list
+  ))
+```
+
+```{r}
+compare_models <- function(model_list2){
+  model_names <- c("nb", "knn", "xgbTree", "svmRadial", "svmPoly", "svmLinear", 
+                   "multinom", "bagFDA", "sda", "ada", "J48", "treebag", "ctree", 
+                   "rf", "rpart", "pda2", "pls", "blackboost", "gbm", "glm", "JRip")
+  
+  min_accuracy <- c()
+  mean_accuracy <- c()
+  sd_accuracy <- c()
+  
+  # Loop through each model name in the list
+  for (model_name in model_names) {
+    if (!is.null(model_list2[[model_name]])) {
+      min_accuracy <- c(min_accuracy, min(model_list2[[model_name]]$resample$Accuracy))
+      mean_accuracy <- c(mean_accuracy, mean(model_list2[[model_name]]$resample$Accuracy))
+      sd_accuracy <- c(sd_accuracy, sd(model_list2[[model_name]]$resample$Accuracy))
+    } else {
+      # If model is missing, append NA
+      min_accuracy <- c(min_accuracy, NA)
+      mean_accuracy <- c(mean_accuracy, NA)
+      sd_accuracy <- c(sd_accuracy, NA)
+    }
+  }
+  
+  result <- data.frame(
+    model_name = model_names,
+    min_accuracy = min_accuracy,
+    mean_accuracy = mean_accuracy,
+    sd_accuracy = sd_accuracy
+  )
+  
+  result <- result[order(result$mean_accuracy, decreasing = TRUE), ]
+  
+  return(result)
+}
+
+compare_models(model_list2)
+```
+
+
+```{r}
+fitControl <- trainControl(
+  method="repeatedcv", 
+  number=3,
+  repeats=10,
+  savePredictions = 'final',  # Save predictions for the final model
+  classProbs = TRUE            # Save class probabilities
+)
+
+set.seed(123)
+Model_single = caret::train(
+  x = d6[,predictors], 
+  y = as.factor(ifelse(d6[,2] == 0, "no", "yes")), 
+  method = 'sda', 
+  trControl = fitControl, 
+  tuneLength=3)
+
+```
+
+
+```{r}
+d7 = d51[all_duplicated(d51$surname), ]
+d7 = mutate(d7, anti_WCG = abs(1-WC))
+supplement_1 = reframe(group_by(d7, surname), Percentage_WC_survived = (sum(Survived * WC) - (Survived * WC)) / (sum(WC) - WC), ID = ID)
+supplement_1 = supplement_1[!is.na(supplement_1$Percentage_WC_survived), ]
+supplement2 = subset(d7, ID %in% supplement_1$ID)
+supplement2 = left_join(supplement2, supplement_1[,2:3], by = "ID")
+
+d8 = supplement2[supplement2["WC"] == 1,]
+predictors = c("Pclass", "Age", "SibSp", "Parch", "Embarked", "fam_size", "Title_bin", "Deck", "Sex_dummy", "Fare_bin", "Percentage_WC_survived")
+
+fitControl <- trainControl(
+  method="cv", 
+  number=3, 
+#  repeats=5,
+  savePredictions = 'final',  # Save predictions for the final model
+  classProbs = TRUE            # Save class probabilities
+)
+
+method_list <- c("nb", "knn", "xgbTree", "svmRadial", "svmPoly", "svmLinear", 
+                 "multinom", "bagFDA", "sda", "ada", "J48", "treebag", "ctree",
+                 "rf", "rpart", "pda2", "pls", "blackboost", "gbm", "glm", "JRip")
+
+set.seed(123)
+model_list2 <- suppressWarnings(caretList(
+  x = d8[,predictors], 
+  y = as.factor(ifelse(d8[,2] == 0, "no", "yes")), 
+  trControl = fitControl, 
+  methodList = method_list
+  ))
+```
+
+```{r}
+compare_models(model_list2)
+```
+
+
+```{r}
+fitControl <- trainControl(
+  method="repeatedcv", 
+  number=3,
+  repeats=10,
+  savePredictions = 'final',  # Save predictions for the final model
+  classProbs = TRUE            # Save class probabilities
+)
+
+set.seed(123)
+Model_WC_WCcounterpart = caret::train(
+  x = d8[,predictors], 
+  y = as.factor(ifelse(d8[,2] == 0, "no", "yes")), 
+  method = 'bagFDA', 
+  trControl = fitControl, 
+  tuneLength=3)
+
+min(Model_WC_WCcounterpart$resample$Accuracy)
+```
+
+```{r}
+d7 = d51[all_duplicated(d51$surname), ]
+d7 = mutate(d7, anti_WCG = abs(1-WC))
+
+supplement_1 = reframe(group_by(d7, surname), Percentage_not_WC_survived = (sum(Survived * anti_WCG) - (Survived * anti_WCG)) / (sum(anti_WCG) - anti_WCG), ID = ID)
+```
+
+
+```{r}
+supplement_1 = supplement_1[!is.na(supplement_1$Percentage_not_WC_survived), ]
+supplement2 = subset(d7, ID %in% supplement_1$ID)
+supplement2 = left_join(supplement2, supplement_1[,2:3], by = "ID")
+```
+
+```{r}
+d8 = supplement2[supplement2["WC"] == 1,]
+predictors = c("Pclass", "Age", "SibSp", "Parch", "Embarked", "fam_size", "Title_bin", "Deck", "Sex_dummy", "Fare_bin", "Percentage_not_WC_survived")
+
+fitControl <- trainControl(
+  method="cv", 
+  number=3, 
+#  repeats=5,
+  savePredictions = 'final',  # Save predictions for the final model
+  classProbs = TRUE            # Save class probabilities
+)
+
+method_list <- c("nb", "knn", "xgbTree", "svmRadial", "svmPoly", "svmLinear", 
+                 "multinom", "bagFDA", "sda", "ada", "J48", "treebag", "ctree",
+                 "rf", "rpart", "pda2", "pls", "blackboost", "gbm", "glm", "JRip")
+
+set.seed(123)
+model_list2 <- suppressWarnings(caretList(
+  x = d8[,predictors], 
+  y = as.factor(ifelse(d8[,2] == 0, "no", "yes")), 
+  trControl = fitControl, 
+  methodList = method_list
+  ))
+```
+
+```{r}
+compare_models(model_list2)
+```
+
+
+```{r}
+fitControl <- trainControl(
+  method="repeatedcv", 
+  number=3,
+  repeats=10,
+  savePredictions = 'final',  # Save predictions for the final model
+  classProbs = TRUE            # Save class probabilities
+)
+
+set.seed(123)
+Model_WC_no_WCcounterpart = caret::train(
+  x = d8[,predictors], 
+  y = as.factor(ifelse(d8[,2] == 0, "no", "yes")), 
+  method = 'svmPoly', 
+  trControl = fitControl, 
+  tuneLength=3)
+
+min(Model_WC_no_WCcounterpart$resample$Accuracy)
+```
+
+
+```{r}
+d7 = d51[all_duplicated(d51$surname), ]
+d7 = mutate(d7, anti_WCG = abs(1-WC))
+supplement_1 = reframe(group_by(d7, surname), Percentage_all_survived = (sum(Survived) - Survived) / (n() - 1), ID = ID)
+```
+
+
+```{r}
+supplement_1 = supplement_1[!is.na(supplement_1$Percentage_all_survived), ]
+supplement2 = subset(d7, ID %in% supplement_1$ID)
+supplement2 = left_join(supplement2, supplement_1[,2:3], by = "ID")
+supplement2 = mutate(supplement2, someone_dead = ifelse(Percentage_all_survived == 1, 0, 1))
+```
+
+```{r}
+d8 = supplement2[supplement2["WC"] == 0,]
+predictors = c("Pclass", "Age", "SibSp", "Parch", "Embarked", "fam_size", "Title_bin", "Deck", "Fare_bin", "Percentage_all_survived", "someone_dead")
+
+fitControl <- trainControl(
+  method="cv", 
+  number=3, 
+#  repeats=5,
+  savePredictions = 'final',  # Save predictions for the final model
+  classProbs = TRUE            # Save class probabilities
+)
+
+method_list <- c("nb", "knn", "xgbTree", "svmRadial", "svmPoly", "svmLinear", 
+                 "multinom", "bagFDA", "sda", "ada", "J48", "treebag", "ctree",
+                 "rf", "rpart", "pda2", "pls", "blackboost", "gbm", "glm", "JRip")
+
+set.seed(123)
+model_list2 <- suppressWarnings(caretList(
+  x = d8[,predictors], 
+  y = as.factor(ifelse(d8[,2] == 0, "no", "yes")), 
+  trControl = fitControl, 
+  methodList = method_list
+  ))
+```
+
+```{r}
+compare_models(model_list2)
+```
+
+
+```{r}
+fitControl <- trainControl(
+  method="repeatedcv", 
+  number=3,
+  repeats=10,
+  savePredictions = 'final',  # Save predictions for the final model
+  classProbs = TRUE            # Save class probabilities
+)
+
+set.seed(123)
+Model_no_WC_any_counterparty = caret::train(
+  x = d8[,predictors], 
+  y = as.factor(ifelse(d8[,2] == 0, "no", "yes")), 
+  method = 'svmPoly', 
+  trControl = fitControl, 
+  tuneLength=3)
+
+min(Model_no_WC_any_counterparty$resample$Accuracy)
+
+predict(Model_no_WC_any_counterparty, d8[,predictors])
+```
+
+
+```{r}
+d52 = mutate(d52, anti_WCG = abs(1-WC),
+             ID = 892:1309)
+supp = mutate(d51, anti_WCG = abs(1-WC))
+supp = reframe(group_by(supp, surname),
+        Percentage_WC_survived = (sum(Survived * WC)) / (sum(WC)),
+        Percentage_not_WC_survived = (sum(Survived * anti_WCG)) / sum(anti_WCG),
+        Percentage_all_survived = sum(Survived) / n(),
+        someone_dead = ifelse(Percentage_all_survived == 1, 0, 1),
+        ID = ID
+        )
+
+supp = supp[!duplicated(supp$surname), ]
+```
+
+
+```{r}
+# GENERIC MODEL
+generic_set = subset(d52, !(surname %in% d51$surname))
+set1 = cbind(generic_set["ID"], predictions = predict(Model_single, generic_set))
+```
+
+
+```{r}
+# MODEL WC WITH WC COUNTERPART (Best)
+sub = subset(d51, surname %in% d52$surname & WC == 1)
+generic_set = subset(sub, surname %in% supp$surname)
+generic_set = left_join(generic_set, supp[c("surname", "Percentage_WC_survived")], by = "surname")
+
+
+element1 = supp[!(is.na(supp$Percentage_WC_survived)),][,1:2]
+element2 = subset(d52, surname %in% element1$surname & WC == 1)
+sub1 = left_join(element2, element1, by = "surname")
+
+set2 = cbind(sub1["ID"], predictions = predict(Model_WC_WCcounterpart, sub1))
+```
+
+
+```{r}
+# MODEL WC WITH no-WC COUNTERPART
+sub = subset(d51, surname %in% d52$surname & WC == 1)
+generic_set = subset(sub, surname %in% supp$surname)
+generic_set = left_join(generic_set, supp[c("surname", "Percentage_WC_survived")], by = "surname")
+
+
+element11 = supp[!(is.na(supp$Percentage_not_WC_survived)),][,c(1,3)]
+element22 = subset(d52, surname %in% element11$surname & WC == 1)
+sub1 = left_join(element22, element11, by = "surname")
+
+predictors = c("Pclass", "Age", "SibSp", "Parch", "Embarked", "fam_size", "Title_bin", "Deck", "Sex_dummy", "Fare_bin", "Percentage_not_WC_survived")
+
+set3 = cbind(sub1["ID"], predictions = predict(Model_WC_no_WCcounterpart, sub1[,predictors]))
+
+set3 = subset(set3, !(ID %in% set2$ID))
+```
+
+```{r}
+# MODEL NO WCG
+sub = subset(d52, surname %in% d51$surname & WC == "0")
+sub1 = left_join(sub, supp[,c(1, 4, 5)], by = "surname")
+
+predictors = c("Pclass", "Age", "SibSp", "Parch", "Embarked", "fam_size", "Title_bin", "Deck", "Fare_bin", "Percentage_all_survived", "someone_dead")
+
+set4 = cbind(sub1["ID"], predictions = predict(Model_no_WC_any_counterparty, sub1[,predictors]))
+```
+
+```{r}
+final = rbind(set1, set2, set3, set4)
+final$predictions = ifelse(final$predictions == "yes", 1, 0)
+final = final[order(final$ID), ]
+```
+
+
+```{r}
+# There are some singles sharing ticket, let's improve the predictions!
+d51[!all_duplicated(d51$surname), ]
+subset(d52, !(surname %in% d51$surname) & (ticket %in% d51$ticket))
+```
+
+
+```{r}
+ticket_train = subset(d51, ticket %in% d51[all_duplicated(d51$ticket), "ticket"])
+ticket_train = mutate(ticket_train, anti_sex_dummy = abs(1-ticket_train$Sex_dummy))
+
+key = reframe(group_by(ticket_train, ticket), 
+        percentage_all = (sum(Survived) - Survived) / (n() - 1),
+        #percentage_female_counterparty = (sum(Survived * Sex_dummy) - (Survived * Sex_dummy)) / (sum(Sex_dummy) - Sex_dummy),
+        #percentage_male_counterparty = (sum(Survived * anti_sex_dummy) - (Survived * anti_sex_dummy)) / (sum(anti_sex_dummy) - anti_sex_dummy)
+        avg_age = (sum(Age) - Age) / (n() - 1),
+        ID = ID)
+
+left_join(ticket_train, key[,c(2:4)], by = "ID")
+```
+
+
+```{r}
+d10 = left_join(ticket_train, key[,c(2:4)], by = "ID")
+predictors = c("Pclass", "Age",  "Embarked", "Title_bin", "Sex_dummy", "Deck", "Fare_bin", "WC", "percentage_all")
+
+fitControl <- trainControl(
+  method="cv", 
+  number=3, 
+#  repeats=5,
+  savePredictions = 'final',  # Save predictions for the final model
+  classProbs = TRUE            # Save class probabilities
+)
+
+method_list <- c("nb", "knn", "xgbTree", "svmRadial", "svmPoly", "svmLinear", 
+                 "multinom", "bagFDA", "sda", "ada", "J48", "treebag", "ctree",
+                 "rf", "rpart", "pda2", "pls", "blackboost", "gbm", "glm", "JRip")
+
+set.seed(123)
+model_list2 <- suppressWarnings(caretList(
+  x = d10[,predictors], 
+  y = as.factor(ifelse(d10[,2] == 0, "no", "yes")), 
+  trControl = fitControl, 
+  methodList = method_list
+  ))
+```
+
+
+```{r}
+compare_models(model_list2)
+```
+
+
+```{r}
+fitControl <- trainControl(
+  method="repeatedcv", 
+  number=3,
+  repeats=10,
+  savePredictions = 'final',  # Save predictions for the final model
+  classProbs = TRUE            # Save class probabilities
+)
+
+set.seed(123)
+Model_same_ticket_diff_surname = caret::train(
+  x = d10[,predictors], 
+  y = as.factor(ifelse(d10[,2] == 0, "no", "yes")), 
+  method = 'xgbTree', 
+  trControl = fitControl, 
+  tuneLength=3)
+```
+
+
+```{r}
+# Predictions
+subset = subset(d52, !(surname %in% d51$surname) & (ticket %in% d51$ticket))
+key = reframe(group_by(d51, ticket), percentage_all = sum(Survived)/n())
+subset = left_join(subset, key, by = "ticket")
+set5 = as.data.frame(cbind(subset$ID, ifelse(predict(Model_same_ticket_diff_surname, subset) == "yes", 1, 0)))
+colnames(set5) = c("ID", "predictions")
+set5
+```
+
+
+```{r}
+final_df = rbind(subset(final, !(ID %in% set5$ID)), set5)
+final_df = final_df[order(final_df$ID), ]
+colnames(final_df) = c("PassengerId", "Survived")
+write.csv(final_df, "titanic.csv", row.names = FALSE)
+```
